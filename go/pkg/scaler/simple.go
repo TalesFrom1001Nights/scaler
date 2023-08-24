@@ -17,27 +17,32 @@ import (
 	"container/list"
 	"context"
 	"fmt"
+	"log"
+	"sync"
+	"sync/atomic"
+	"time"
+
 	"github.com/AliyunContainerService/scaler/go/pkg/config"
 	model2 "github.com/AliyunContainerService/scaler/go/pkg/model"
 	platform_client2 "github.com/AliyunContainerService/scaler/go/pkg/platform_client"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"log"
-	"sync"
-	"time"
 
 	pb "github.com/AliyunContainerService/scaler/proto"
 	"github.com/google/uuid"
 )
 
 type Simple struct {
-	config         *config.Config
-	metaData       *model2.Meta
-	platformClient platform_client2.Client
-	mu             sync.Mutex
-	wg             sync.WaitGroup
-	instances      map[string]*model2.Instance
-	idleInstance   *list.List
+	config          *config.Config
+	metaData        *model2.Meta
+	platformClient  platform_client2.Client
+	mu              sync.Mutex
+	wg              sync.WaitGroup
+	instances       map[string]*model2.Instance
+	idleInstance    *list.List
+	longPollingMu   sync.Mutex
+	longPollingList *list.List
+	creatingNum     int64
 }
 
 func New(metaData *model2.Meta, config *config.Config) Scaler {
@@ -46,13 +51,16 @@ func New(metaData *model2.Meta, config *config.Config) Scaler {
 		log.Fatalf("client init with error: %s", err.Error())
 	}
 	scheduler := &Simple{
-		config:         config,
-		metaData:       metaData,
-		platformClient: client,
-		mu:             sync.Mutex{},
-		wg:             sync.WaitGroup{},
-		instances:      make(map[string]*model2.Instance),
-		idleInstance:   list.New(),
+		config:          config,
+		metaData:        metaData,
+		platformClient:  client,
+		mu:              sync.Mutex{},
+		wg:              sync.WaitGroup{},
+		instances:       make(map[string]*model2.Instance),
+		idleInstance:    list.New(),
+		longPollingMu:   sync.Mutex{},
+		longPollingList: list.New(),
+		creatingNum:     0,
 	}
 	log.Printf("New scaler for app: %s is created", metaData.Key)
 	scheduler.wg.Add(1)
@@ -65,21 +73,38 @@ func New(metaData *model2.Meta, config *config.Config) Scaler {
 	return scheduler
 }
 
+func (s *Simple) notifyRequest(instance *model2.Instance) {
+	s.longPollingMu.Lock()
+	if element := s.longPollingList.Front(); element != nil {
+		// 有长轮询请求
+		log.Printf("notify long polling request, instance: %s", instance.Id)
+		longPollingChan := element.Value.(chan *model2.Instance)
+		s.longPollingList.Remove(element)
+		longPollingChan <- instance
+		s.longPollingMu.Unlock()
+	} else {
+		// 加入到空闲资源池
+		log.Printf("add to idleInstance, instance: %s", instance.Id)
+		s.longPollingMu.Unlock()
+		instance.Busy = false
+		instance.LastIdleTime = time.Now()
+		s.mu.Lock()
+		s.idleInstance.PushFront(instance)
+		s.mu.Unlock()
+	}
+}
+
 func (s *Simple) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.AssignReply, error) {
-	start := time.Now()
-	instanceId := uuid.New().String()
-	defer func() {
-		log.Printf("Assign, request id: %s, instance id: %s, cost %dms", request.RequestId, instanceId, time.Since(start).Milliseconds())
-	}()
 	log.Printf("Assign, request id: %s", request.RequestId)
+	start := time.Now()
+	// 有空闲资源
 	s.mu.Lock()
 	if element := s.idleInstance.Front(); element != nil {
 		instance := element.Value.(*model2.Instance)
 		instance.Busy = true
 		s.idleInstance.Remove(element)
 		s.mu.Unlock()
-		log.Printf("Assign, request id: %s, instance %s reused", request.RequestId, instance.Id)
-		instanceId = instance.Id
+		log.Printf("Assign idleInstance, request id: %s, instance %s, cost time = %s", request.RequestId, instance.Id, time.Since(start))
 		return &pb.AssignReply{
 			Status: pb.Status_Ok,
 			Assigment: &pb.Assignment{
@@ -92,54 +117,41 @@ func (s *Simple) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.Ass
 	}
 	s.mu.Unlock()
 
-	//Create new Instance
-	resourceConfig := model2.SlotResourceConfig{
-		ResourceConfig: pb.ResourceConfig{
-			MemoryInMegabytes: request.MetaData.MemoryInMb,
-		},
-	}
-	slot, err := s.platformClient.CreateSlot(ctx, request.RequestId, &resourceConfig)
-	if err != nil {
-		errorMessage := fmt.Sprintf("create slot failed with: %s", err.Error())
-		log.Printf(errorMessage)
-		return nil, status.Errorf(codes.Internal, errorMessage)
-	}
+	// 无空闲资源
+	longPollingChan := make(chan *model2.Instance, 1)
+	s.longPollingMu.Lock()
+	s.longPollingList.PushBack(longPollingChan)
 
-	meta := &model2.Meta{
-		Meta: pb.Meta{
-			Key:           request.MetaData.Key,
-			Runtime:       request.MetaData.Runtime,
-			TimeoutInSecs: request.MetaData.TimeoutInSecs,
-		},
+	// create instance limit
+	if s.longPollingList.Len() > int(atomic.LoadInt64(&s.creatingNum)) {
+		go func() {
+			s.createInstance(request.MetaData, request.RequestId)
+		}()
 	}
-	instance, err := s.platformClient.Init(ctx, request.RequestId, instanceId, slot, meta)
-	if err != nil {
-		errorMessage := fmt.Sprintf("create instance failed with: %s", err.Error())
-		log.Printf(errorMessage)
-		return nil, status.Errorf(codes.Internal, errorMessage)
+	s.longPollingMu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		log.Printf("assign timeout request id: %s", request.RequestId)
+		return nil, ctx.Err()
+	case instance := <-longPollingChan:
+		instance.Busy = true
+		log.Printf("Assign longPolling, request id: %s, instance %s, cost time: %s", request.RequestId, instance.Id, time.Since(start))
+		return &pb.AssignReply{
+			Status: pb.Status_Ok,
+			Assigment: &pb.Assignment{
+				RequestId:  request.RequestId,
+				MetaKey:    instance.Meta.Key,
+				InstanceId: instance.Id,
+			},
+			ErrorMessage: nil,
+		}, nil
 	}
-
-	//add new instance
-	s.mu.Lock()
-	instance.Busy = true
-	s.instances[instance.Id] = instance
-	s.mu.Unlock()
-	log.Printf("request id: %s, instance %s for app %s is created, init latency: %dms", request.RequestId, instance.Id, instance.Meta.Key, instance.InitDurationInMs)
-
-	return &pb.AssignReply{
-		Status: pb.Status_Ok,
-		Assigment: &pb.Assignment{
-			RequestId:  request.RequestId,
-			MetaKey:    instance.Meta.Key,
-			InstanceId: instance.Id,
-		},
-		ErrorMessage: nil,
-	}, nil
 }
 
 func (s *Simple) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.IdleReply, error) {
 	if request.Assigment == nil {
-		return nil, status.Errorf(codes.InvalidArgument, fmt.Sprintf("assignment is nil"))
+		return nil, status.Errorf(codes.InvalidArgument, "assignment is nil")
 	}
 	reply := &pb.IdleReply{
 		Status:       pb.Status_Ok,
@@ -166,18 +178,21 @@ func (s *Simple) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.IdleRep
 	defer s.mu.Unlock()
 	if instance := s.instances[instanceId]; instance != nil {
 		slotId = instance.Slot.Id
-		instance.LastIdleTime = time.Now()
 		if needDestroy {
 			log.Printf("request id %s, instance %s need be destroy", request.Assigment.RequestId, instanceId)
 			return reply, nil
 		}
 
-		if instance.Busy == false {
+		if !instance.Busy {
 			log.Printf("request id %s, instance %s already freed", request.Assigment.RequestId, instanceId)
 			return reply, nil
 		}
-		instance.Busy = false
-		s.idleInstance.PushFront(instance)
+
+		go func() {
+			log.Printf("Idle notify request, instance: %s", instance.Id)
+			s.notifyRequest(instance)
+		}()
+
 	} else {
 		return nil, status.Errorf(codes.NotFound, fmt.Sprintf("request id %s, instance %s not found", request.Assigment.RequestId, instanceId))
 	}
@@ -202,7 +217,7 @@ func (s *Simple) gcLoop() {
 			s.mu.Lock()
 			if element := s.idleInstance.Back(); element != nil {
 				instance := element.Value.(*model2.Instance)
-				idleDuration := time.Now().Sub(instance.LastIdleTime)
+				idleDuration := time.Since(instance.LastIdleTime)
 				if idleDuration > s.config.IdleDurationBeforeGC {
 					//need GC
 					s.idleInstance.Remove(element)
@@ -232,4 +247,47 @@ func (s *Simple) Stats() Stats {
 		TotalInstance:     len(s.instances),
 		TotalIdleInstance: s.idleInstance.Len(),
 	}
+}
+
+func (s *Simple) createInstance(requestMeta *pb.Meta, requestId string) {
+	atomic.AddInt64(&s.creatingNum, 1)
+	defer atomic.AddInt64(&s.creatingNum, -1)
+	//Create new Instance
+	instanceId := uuid.New().String()
+	resourceConfig := model2.SlotResourceConfig{
+		ResourceConfig: pb.ResourceConfig{
+			MemoryInMegabytes: requestMeta.MemoryInMb,
+		},
+	}
+
+	slot, err := s.platformClient.CreateSlot(context.Background(), requestId, &resourceConfig)
+	if err != nil {
+		log.Printf("create slot failed with: %s", err.Error())
+		return
+	}
+
+	meta := &model2.Meta{
+		Meta: pb.Meta{
+			Key:           requestMeta.Key,
+			Runtime:       requestMeta.Runtime,
+			TimeoutInSecs: requestMeta.TimeoutInSecs,
+		},
+	}
+	instance, err := s.platformClient.Init(context.Background(), requestId, instanceId, slot, meta)
+	if err != nil {
+		log.Printf("create instance failed with: %s", err.Error())
+		return
+	}
+
+	s.mu.Lock()
+	s.instances[instance.Id] = instance
+	s.mu.Unlock()
+
+	//notify
+	go func() {
+		log.Printf("createInstance notify request, instance: %s", instance.Id)
+		s.notifyRequest(instance)
+	}()
+
+	log.Printf("request id: %s, instance %s for app %s is created, init latency: %dms", requestId, instance.Id, instance.Meta.Key, instance.InitDurationInMs)
 }
