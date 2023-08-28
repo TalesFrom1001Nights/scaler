@@ -33,16 +33,21 @@ import (
 )
 
 type Simple struct {
-	config          *config.Config
-	metaData        *model2.Meta
-	platformClient  platform_client2.Client
-	mu              sync.Mutex
-	wg              sync.WaitGroup
-	instances       map[string]*model2.Instance
+	config         *config.Config
+	metaData       *model2.Meta
+	platformClient platform_client2.Client
+	mu             sync.Mutex
+	wg             sync.WaitGroup
+	// instances内存映射表,key是实例id
+	instances map[string]*model2.Instance
+	// instances空闲队列
 	idleInstance    *list.List
 	longPollingMu   sync.Mutex
 	longPollingList *list.List
-	creatingNum     int64
+	// 正在创建的实例数
+	creatingNum      int64
+	runtimeStatus    *RuntimeStatus
+	creatingDuration int64
 }
 
 func New(metaData *model2.Meta, config *config.Config) Scaler {
@@ -61,8 +66,10 @@ func New(metaData *model2.Meta, config *config.Config) Scaler {
 		longPollingMu:   sync.Mutex{},
 		longPollingList: list.New(),
 		creatingNum:     0,
+		runtimeStatus:   NewRuntimeStatus(),
 	}
 	log.Printf("New scaler for app: %s is created", metaData.Key)
+	// 回收pod
 	scheduler.wg.Add(1)
 	go func() {
 		defer scheduler.wg.Done()
@@ -73,17 +80,22 @@ func New(metaData *model2.Meta, config *config.Config) Scaler {
 	return scheduler
 }
 
+// 通知等待的请求,有空闲的instance
 func (s *Simple) notifyRequest(instance *model2.Instance) {
 	s.longPollingMu.Lock()
+	// 如果有等待的长轮询请求
 	if element := s.longPollingList.Front(); element != nil {
 		// 有长轮询请求
 		log.Printf("notify long polling request, instance: %s", instance.Id)
+		// 获取请求的channel
 		longPollingChan := element.Value.(chan *model2.Instance)
+		// 从队列中删除
 		s.longPollingList.Remove(element)
+		// 发送实例通知
 		longPollingChan <- instance
 		s.longPollingMu.Unlock()
 	} else {
-		// 加入到空闲资源池
+		// 没有等待请求，将释放的instance加入到空闲资源池
 		log.Printf("add to idleInstance, instance: %s", instance.Id)
 		s.longPollingMu.Unlock()
 		instance.Busy = false
@@ -94,14 +106,21 @@ func (s *Simple) notifyRequest(instance *model2.Instance) {
 	}
 }
 
+// Assign 处理分配实例请求
 func (s *Simple) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.AssignReply, error) {
 	log.Printf("Assign, request id: %s", request.RequestId)
+	defer func() {
+		go s.runtimeStatus.AssignReturn(request.RequestId)
+	}()
+	// 记录处理开始时间
 	start := time.Now()
 	// 有空闲资源
 	s.mu.Lock()
 	if element := s.idleInstance.Front(); element != nil {
 		instance := element.Value.(*model2.Instance)
+		// 设置实例为忙碌
 		instance.Busy = true
+		// 从空闲队列中移除
 		s.idleInstance.Remove(element)
 		s.mu.Unlock()
 		log.Printf("Assign idleInstance, request id: %s, instance %s, cost time = %s", request.RequestId, instance.Id, time.Since(start))
@@ -123,6 +142,7 @@ func (s *Simple) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.Ass
 	s.longPollingList.PushBack(longPollingChan)
 
 	// create instance limit
+	// 如果当前创建数没有达到限制,创建新实例
 	if s.longPollingList.Len() > int(atomic.LoadInt64(&s.creatingNum)) {
 		go func() {
 			s.createInstance(request.MetaData, request.RequestId)
@@ -150,6 +170,9 @@ func (s *Simple) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.Ass
 }
 
 func (s *Simple) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.IdleReply, error) {
+	go func() {
+		s.runtimeStatus.IdleStart(request.Assigment.RequestId)
+	}()
 	if request.Assigment == nil {
 		return nil, status.Errorf(codes.InvalidArgument, "assignment is nil")
 	}
@@ -209,6 +232,7 @@ func (s *Simple) deleteSlot(ctx context.Context, requestId, slotId, instanceId, 
 	}
 }
 
+// 周期回收
 func (s *Simple) gcLoop() {
 	log.Printf("gc loop for app: %s is started", s.metaData.Key)
 	ticker := time.NewTicker(s.config.GcInterval)
@@ -221,8 +245,10 @@ func (s *Simple) gcLoop() {
 				if idleDuration > s.config.IdleDurationBeforeGC {
 					//need GC
 					s.idleInstance.Remove(element)
+					// 从map删除
 					delete(s.instances, instance.Id)
 					s.mu.Unlock()
+					// 回收实例
 					go func() {
 						reason := fmt.Sprintf("Idle duration: %fs, excceed configured duration: %fs", idleDuration.Seconds(), s.config.IdleDurationBeforeGC.Seconds())
 						ctx := context.Background()
@@ -249,6 +275,8 @@ func (s *Simple) Stats() Stats {
 }
 
 func (s *Simple) createInstance(requestMeta *pb.Meta, requestId string) {
+	creatingTime := time.Now()
+	// 将creating数量+1
 	atomic.AddInt64(&s.creatingNum, 1)
 	defer atomic.AddInt64(&s.creatingNum, -1)
 	//Create new Instance
@@ -287,7 +315,7 @@ func (s *Simple) createInstance(requestMeta *pb.Meta, requestId string) {
 		log.Printf("createInstance notify request, instance: %s", instance.Id)
 		s.notifyRequest(instance)
 	}()
-
+	go atomic.CompareAndSwapInt64(&s.creatingDuration, 0, int64(time.Since(creatingTime)))
 	log.Printf("request id: %s, instance %s for app %s is created, init latency: %dms", requestId, instance.Id, instance.Meta.Key, instance.InitDurationInMs)
 }
 
