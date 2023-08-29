@@ -19,6 +19,7 @@ type Config struct {
 	ClientAddr           string
 	GcInterval           time.Duration
 	IdleDurationBeforeGC time.Duration
+	RctRate              float64
 }
 
 var DefaultConfig *Config
@@ -28,5 +29,6 @@ func init() {
 		ClientAddr:           "127.0.0.1:50051",
 		GcInterval:           1 * time.Second,
 		IdleDurationBeforeGC: 5 * time.Minute,
+		RctRate:              0.9,
 	}
 }

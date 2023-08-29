@@ -1,6 +1,8 @@
 package scaler
 
 import (
+	"container/list"
+	"github.com/AliyunContainerService/scaler/go/pkg/config"
 	"sync"
 	"time"
 )
@@ -10,13 +12,18 @@ type RuntimeStatus struct {
 	requestDurationMu sync.Mutex
 	requestCostTime   time.Duration
 	rctRate           float64
+	requestInstance   *list.List
+	requestInstanceMu sync.Mutex
+	maxRequestNum     int64
 }
 
 func NewRuntimeStatus() *RuntimeStatus {
 	r := &RuntimeStatus{
 		requestDuration:   make(map[string]time.Time),
 		requestDurationMu: sync.Mutex{},
-		rctRate:           0.9,
+		rctRate:           config.DefaultConfig.RctRate,
+		requestInstanceMu: sync.Mutex{},
+		requestInstance:   list.New(),
 	}
 	return r
 }
@@ -45,4 +52,48 @@ func (r *RuntimeStatus) GetRequestCostTime() time.Duration {
 	r.requestDurationMu.Lock()
 	defer r.requestDurationMu.Unlock()
 	return r.requestCostTime
+}
+
+func (r *RuntimeStatus) AssignStart(timeStamp time.Time) {
+	requestCostTime := r.GetRequestCostTime()
+	r.requestInstanceMu.Lock()
+	defer r.requestInstanceMu.Unlock()
+	r.requestInstance.PushBack(timeStamp)
+	// 遍历request队列，timeStamp>requestCostTime则删除
+	for element := r.requestInstance.Front(); element.Value.(time.Time) != timeStamp; element = element.Next() {
+		elemTimeStamp := element.Value.(time.Time)
+		if time.Since(elemTimeStamp) > requestCostTime {
+			r.requestInstance.Remove(element)
+		}
+	}
+	//记录当前请求数量
+	requestNum := r.requestInstance.Len()
+	// 更新最大并发请求数量
+	if int64(requestNum) > r.maxRequestNum {
+		r.maxRequestNum = int64(requestNum)
+	}
+}
+
+func (r *RuntimeStatus) getMaxRequestBNum() int64 {
+	return r.maxRequestNum
+}
+
+func (r *RuntimeStatus) getCurrentRequestBNum() int64 {
+	requestCostTime := r.GetRequestCostTime()
+	r.requestInstanceMu.Lock()
+	defer r.requestInstanceMu.Unlock()
+	// 遍历request队列，timeStamp>requestCostTime则删除
+	for element := r.requestInstance.Front(); element != nil; element = element.Next() {
+		elemTimeStamp := element.Value.(time.Time)
+		if time.Since(elemTimeStamp) > requestCostTime {
+			r.requestInstance.Remove(element)
+		}
+	}
+	//记录当前请求数量
+	requestNum := int64(r.requestInstance.Len())
+	// 更新最大并发请求数量
+	if requestNum > r.maxRequestNum {
+		r.maxRequestNum = requestNum
+	}
+	return requestNum
 }

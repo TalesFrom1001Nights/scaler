@@ -108,6 +108,7 @@ func (s *Simple) notifyRequest(instance *model2.Instance) {
 
 // Assign 处理分配实例请求
 func (s *Simple) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.AssignReply, error) {
+	go s.runtimeStatus.AssignStart(time.Now())
 	log.Printf("Assign, request id: %s", request.RequestId)
 	defer func() {
 		go s.runtimeStatus.AssignReturn(request.RequestId)
