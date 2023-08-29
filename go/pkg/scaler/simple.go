@@ -230,7 +230,6 @@ func (s *Simple) gcLoop() {
 						defer cancel()
 						s.deleteSlot(ctx, uuid.NewString(), instance.Slot.Id, instance.Id, instance.Meta.Key, reason)
 					}()
-
 					continue
 				}
 			}
@@ -290,4 +289,13 @@ func (s *Simple) createInstance(requestMeta *pb.Meta, requestId string) {
 	}()
 
 	log.Printf("request id: %s, instance %s for app %s is created, init latency: %dms", requestId, instance.Id, instance.Meta.Key, instance.InitDurationInMs)
+}
+
+func (s *Simple) CheckLive() bool {
+	// 超过45秒没有消息的时候，返回false
+	return true
+}
+
+func (s *Simple) Clear(rate float64) {
+	// 按照比例释放idleInstance
 }
