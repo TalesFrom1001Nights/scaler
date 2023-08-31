@@ -34,7 +34,7 @@ type Server struct {
 
 func New() *Server {
 	return &Server{
-		mgr: manager.New(&config.DefaultConfig),
+		mgr: manager.New(config.DefaultConfig),
 	}
 }
 
